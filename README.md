@@ -52,14 +52,19 @@ Equivalent `opencode.json(c)` config:
       "context-store": {
         "type": "local",
         "command": ["/path/to/context-store/.venv/bin/python", "-m", "context_store.main"],
+        "codemode": false,
       },
     },
   },
 }
 ```
 
-Tools appear as `tools["context-store"].save(…)` under Code Mode, or `context_store_save`
-with `codemode: false`. The `/context-store:summarize-session` prompt command guides the
+**Recommended: `"codemode": false`** — tools then appear on the provider's
+native tool list as `context-store_save`, `context-store_search`, … (the
+hyphen is kept): plain name + JSON-arguments calls that every tool-trained
+model can emit. OpenCode's default Code Mode instead requires writing strict
+JS (`await tools["context-store"].save(…)`), which small local models often
+get wrong. The `/context-store:summarize-session` prompt command guides the
 model through the summarize-and-store workflow.
 
 ## Tools
