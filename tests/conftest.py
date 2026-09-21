@@ -132,3 +132,14 @@ def store_db(tmp_path):
     conn = connect(tmp_path / "context.db")
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def store_env(tmp_path):
+    """(conn, db_path) pair — for store operations that need the db file path."""
+    from context_store.db import connect
+
+    path = tmp_path / "context.db"
+    conn = connect(path)
+    yield conn, path
+    conn.close()

@@ -14,7 +14,7 @@ no background jobs. The store changes only when a model calls a tool, e.g. when 
 - **BM25 search** — SQLite's built-in FTS5 (phrases, `OR`, prefix `term*`), zero extra dependencies
 - **Session history** — read-only, compact transcripts of past OpenCode sessions
 - **Provenance** — notes can record which session/project created them
-- **Lifecycle** — browse, upsert, and delete so stale knowledge never lingers
+- **Lifecycle** — browse, upsert, delete (single or bulk, snapshot-guarded) so stale knowledge never lingers
 
 ## Requirements
 
@@ -28,7 +28,7 @@ git clone <repo-url> ~/context-store   # anywhere works
 cd ~/context-store
 python3 -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/python -m pytest -q          # 31 tests should pass
+.venv/bin/python -m pytest -q          # 42 tests should pass
 ```
 
 > On PEP 668 systems (Debian/Ubuntu) without `python3-venv`, either
@@ -75,7 +75,7 @@ model through the summarize-and-store workflow.
 | `read(path)` | Fetch a note by exact path, with full metadata. |
 | `search(query, kind?, tag?, limit?=5)` | BM25 search; snippets with `**highlighted**` matches; lower score = better. |
 | `list(prefix?, kind?, tag?, limit?=50)` | Browse stored paths — call before saving to avoid duplicates. |
-| `delete(path)` | Permanently remove a note; returns a preview of what was deleted. |
+| `delete(path)` / `delete(prefix, expect)` | Permanently remove a note, or all notes under a prefix (bulk — requires the row count from `list`, snapshots the store first). |
 | `stats()` | Totals by kind, top tags, recent saves, DB size. |
 | `sessions_list(project?, since?, limit?=20)` | OpenCode sessions, newest first (read-only). |
 | `session_read(session_id, include_tools?=false, max_chars?=24000)` | Compact transcript of a past session. |
@@ -99,6 +99,9 @@ howto/<task>                             reusable procedures / workarounds
 - *"store actual api docs for fastapi middleware"* → the model fetches the docs page with
   its own web tools → `save("docs/fastapi/middleware", …, source_url=…)`
 - *"what do we know about auth decisions here?"* → `search("auth decision")` or `read` by path
+- *"delete all stored summaries for project X"* → `list(prefix="sessions/X")` →
+  `delete(prefix="sessions/X", expect=<row count>)` — refused on a count mismatch,
+  and always snapshots the store to `backups/` before deleting
 
 ## Configuration
 

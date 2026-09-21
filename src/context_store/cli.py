@@ -59,8 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tag")
     p.add_argument("--limit", type=int, default=50)
 
-    p = sub.add_parser("delete", help="permanently delete a note")
-    p.add_argument("path")
+    p = sub.add_parser("delete", help="permanently delete a note, or all notes under a prefix")
+    p.add_argument("path", nargs="?", help="exact note path (single-note mode)")
+    p.add_argument("--prefix", help="bulk mode: delete all notes under this path prefix")
+    p.add_argument("--expect", type=int, help="bulk mode: row count from `list` (required with --prefix)")
 
     sub.add_parser("stats", help="store overview")
 
@@ -125,10 +127,22 @@ def main(argv: "list[str] | None" = None) -> None:
             except store.StoreError as e:
                 _fail(str(e))
         elif args.command == "delete":
-            result = store.delete_note(conn, args.path)
-            if result is None:
-                _fail(f"no note at path {args.path!r}")
-            _print(result)
+            try:
+                if args.prefix is not None:
+                    if args.path is not None:
+                        _fail("pass either a note path or --prefix, not both")
+                    if args.expect is None:
+                        _fail("--prefix requires --expect (the row count from `list`)")
+                    _print(store.delete_notes(conn, db, prefix=args.prefix, expect=args.expect))
+                else:
+                    if args.path is None:
+                        _fail("pass a note path, or --prefix with --expect")
+                    result = store.delete_note(conn, args.path)
+                    if result is None:
+                        _fail(f"no note at path {args.path!r}")
+                    _print(result)
+            except store.StoreError as e:
+                _fail(str(e))
         elif args.command == "stats":
             _print(store.stats(conn, db))
     finally:

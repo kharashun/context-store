@@ -13,6 +13,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import db
+
 KINDS = ("note", "doc", "session-summary", "decision", "howto")
 
 MAX_PATH_LEN = 512
@@ -20,6 +22,9 @@ DEFAULT_SEARCH_LIMIT = 5
 MAX_SEARCH_LIMIT = 50
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 500
+MAX_BULK_DELETE = 200
+SINGLE_PREVIEW_CHARS = 200
+BULK_PREVIEW_CHARS = 120
 
 
 class StoreError(ValueError):
@@ -75,6 +80,16 @@ def _normalize_tags(tags: "list[str] | str | None") -> str:
 
 def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _normalize_prefix(prefix: str) -> str:
+    """Validate and canonicalize a bulk-delete prefix (same shape as `list_notes`)."""
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise StoreError("prefix must be a non-empty string, e.g. 'sessions/old-project/'")
+    normalized = re.sub(r"/{2,}", "/", prefix.strip().strip("/"))
+    if not normalized:
+        raise StoreError("prefix must contain at least one segment, e.g. 'sessions/old-project/'")
+    return normalized
 
 
 def row_to_note(row: sqlite3.Row) -> dict:
@@ -269,6 +284,21 @@ def list_notes(
     return [dict(r, tags=json.loads(r["tags"] or "[]")) for r in rows]
 
 
+def _note_delete_summary(note: dict, *, preview_chars: int) -> dict:
+    """Shared note summary for delete responses (single and bulk)."""
+    content = note["content"]
+    preview = content[:preview_chars] + ("…" if len(content) > preview_chars else "")
+    return {
+        "path": note["path"],
+        "kind": note["kind"],
+        "title": note["title"],
+        "tags": note["tags"],
+        "content_preview": preview,
+        "created_at": note["created_at"],
+        "updated_at": note["updated_at"],
+    }
+
+
 def delete_note(conn: sqlite3.Connection, path: str) -> dict | None:
     """Permanently delete the note at `path`; return a summary of what was deleted."""
     path = normalize_path(path)
@@ -277,17 +307,65 @@ def delete_note(conn: sqlite3.Connection, path: str) -> dict | None:
         return None
     conn.execute("DELETE FROM notes WHERE path = ?", (path,))
     conn.commit()
-    note = row_to_note(row)
-    preview = note["content"][:200] + ("…" if len(note["content"]) > 200 else "")
+    summary = _note_delete_summary(row_to_note(row), preview_chars=SINGLE_PREVIEW_CHARS)
+    return {"deleted": True, **summary}
+
+
+def delete_notes(
+    conn: sqlite3.Connection,
+    db_path: str | Path,
+    *,
+    prefix: str,
+    expect: int,
+) -> dict:
+    """Delete ALL notes under `prefix` after safety checks + snapshot.
+
+    Guards, all evaluated before any write:
+    - `prefix` is normalized like `list_notes` (string-prefix match)
+    - the match count must be non-zero and at most MAX_BULK_DELETE
+    - `expect` must equal the match count (stale-listing guard — the caller
+      must have run `list` with the same prefix)
+    - a `VACUUM INTO` snapshot is taken first; if it fails, nothing is
+      deleted (fail-closed)
+    """
+    if isinstance(expect, bool) or not isinstance(expect, int) or expect < 0:
+        raise StoreError("expect must be a non-negative integer")
+    prefix = _normalize_prefix(prefix)
+    pattern = _escape_like(prefix) + "%"
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM notes WHERE path LIKE ? ESCAPE '\\'", (pattern,)
+    ).fetchone()["c"]
+    if count == 0:
+        raise StoreError(f"no notes under prefix {prefix!r} — nothing deleted")
+    if count > MAX_BULK_DELETE:
+        raise StoreError(
+            f"{count} notes under prefix {prefix!r} exceed the bulk cap of"
+            f" {MAX_BULK_DELETE} — narrow the prefix or delete in batches"
+        )
+    if count != expect:
+        raise StoreError(
+            f"expect={expect} but {count} notes match prefix {prefix!r} —"
+            " re-run `list` with this prefix and pass the current row count"
+        )
+    try:
+        backup = db.snapshot(conn, db_path)
+    except Exception as e:
+        raise StoreError(f"snapshot failed, bulk delete refused: {e}") from e
+    rows = conn.execute(
+        "SELECT * FROM notes WHERE path LIKE ? ESCAPE '\\'", (pattern,)
+    ).fetchall()
+    conn.execute("DELETE FROM notes WHERE path LIKE ? ESCAPE '\\'", (pattern,))
+    conn.commit()
     return {
         "deleted": True,
-        "path": path,
-        "kind": note["kind"],
-        "title": note["title"],
-        "tags": note["tags"],
-        "content_preview": preview,
-        "created_at": note["created_at"],
-        "updated_at": note["updated_at"],
+        "prefix": prefix,
+        "count": count,
+        "backup": str(backup),
+        "recovery": "copy the backup file over the store db to restore",
+        "notes": [
+            _note_delete_summary(row_to_note(row), preview_chars=BULK_PREVIEW_CHARS)
+            for row in rows
+        ],
     }
 
 

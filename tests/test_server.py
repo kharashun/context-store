@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
@@ -107,5 +108,65 @@ def test_session_tools_over_mcp(env):
             assert "Fix the auth middleware please." in transcript["transcript"]
             assert "I'll refactor the auth middleware." in transcript["transcript"]
             assert "[tool:" not in transcript["transcript"]
+
+    asyncio.run(scenario())
+
+
+def test_bulk_delete_over_mcp(env):
+    async def scenario():
+        async with Client(server_main.mcp) as client:
+            for i in range(3):
+                payload(await client.call_tool("save", {
+                    "path": f"sessions/test/2026-09-21-{i}",
+                    "content": f"summary {i}",
+                    "kind": "session-summary",
+                }))
+            payload(await client.call_tool("save", {
+                "path": "notes/test/keep", "content": "kept",
+            }))
+
+            listed = payload(await client.call_tool("list", {"prefix": "sessions/test"}))
+            assert len(listed) == 3
+
+            result = payload(await client.call_tool("delete", {
+                "prefix": "sessions/test", "expect": 3,
+            }))
+            assert result["deleted"] is True
+            assert result["count"] == 3
+            assert sorted(n["path"] for n in result["notes"]) == [
+                "sessions/test/2026-09-21-0",
+                "sessions/test/2026-09-21-1",
+                "sessions/test/2026-09-21-2",
+            ]
+            backup = Path(result["backup"])
+            assert backup.exists()
+            assert backup.parent == env / "backups"
+
+            remaining = payload(await client.call_tool("list", {}))
+            assert [n["path"] for n in remaining] == ["notes/test/keep"]
+
+    asyncio.run(scenario())
+
+
+def test_bulk_delete_guards_over_mcp(env):
+    async def scenario():
+        async with Client(server_main.mcp) as client:
+            payload(await client.call_tool("save", {
+                "path": "sessions/test/one", "content": "x",
+            }))
+
+            for bad_args in (
+                {"prefix": "sessions/test"},                                # no expect
+                {"prefix": "sessions/test", "expect": 7},                   # wrong expect
+                {"path": "a/b", "prefix": "sessions", "expect": 1},         # both modes
+                {},                                                        # neither
+                {"path": "a/b", "expect": 2},                              # expect w/o prefix
+            ):
+                with pytest.raises(Exception):
+                    await client.call_tool("delete", bad_args)
+
+            # every refused call deleted nothing
+            listed = payload(await client.call_tool("list", {"prefix": "sessions/test"}))
+            assert len(listed) == 1
 
     asyncio.run(scenario())

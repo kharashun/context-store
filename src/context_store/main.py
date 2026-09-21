@@ -170,18 +170,52 @@ def list_paths(
 
 
 @mcp.tool
-def delete(path: str) -> dict:
-    """Permanently delete the note at `path`. Use when stored knowledge is
-    outdated or wrong — stale memory is worse than none.
+def delete(
+    path: str | None = None,
+    prefix: str | None = None,
+    expect: int | None = None,
+) -> dict:
+    """Permanently delete stored notes. Two modes:
+
+    1. delete(path) — one note by exact path.
+    2. delete(prefix, expect) — bulk: ALL notes under a path prefix. Call
+       `list` with the same prefix FIRST and pass the number of rows it
+       returned as `expect`; the call is refused on a count mismatch. A
+       snapshot of the store is taken before deleting (max 200 notes per
+       call); the result includes the snapshot path for manual recovery.
+
+    Deletes ANY kind of note — including session summaries stored under
+    "sessions/<project>/…". Use when stored knowledge is outdated or wrong
+    — stale memory is worse than none.
+
+    Args:
+        path: exact note path, e.g. "sessions/project/2026-09-21-topic"
+        prefix: bulk mode — delete every note whose path starts with this
+        expect: bulk mode — the row count `list` returned for this prefix
 
     Returns:
-        A summary of what was deleted ({deleted, path, kind, title, tags,
-        content_preview, created_at, updated_at}) so the caller can confirm
-        it removed the right note.
+        Single: {deleted, path, kind, title, tags, content_preview,
+        created_at, updated_at}. Bulk: {deleted, prefix, count, backup,
+        recovery, notes} with a preview of every removed note.
     """
-    conn = connect(context_db_path())
+    if (path is None) == (prefix is None):
+        raise ToolError(
+            "pass either `path` (single note) or `prefix` + `expect` (bulk)"
+            " — not both, not neither"
+        )
+    if path is not None and expect is not None:
+        raise ToolError("`expect` applies only to bulk mode — pass `path` alone")
+    if prefix is not None and expect is None:
+        raise ToolError(
+            "bulk delete requires `expect` — the row count `list` returned for this prefix"
+        )
+    db_path = context_db_path()
+    conn = connect(db_path)
     try:
-        result = store.delete_note(conn, path)
+        if path is not None:
+            result = store.delete_note(conn, path)
+        else:
+            result = store.delete_notes(conn, db_path, prefix=prefix, expect=expect)
     except store.StoreError as e:
         raise ToolError(str(e)) from e
     finally:
@@ -213,6 +247,11 @@ def sessions_list(
     """List OpenCode sessions (newest first), read-only. Use before
     `session_read` to find a session id.
 
+    These are OpenCode's own session records (opencode.db) — they are NOT
+    stored in the context store and are not deletable via these tools.
+    Summaries saved to the store are ordinary notes under `sessions/…`,
+    managed with `list`/`read`/`delete`.
+
     Args:
         project: optional substring of the session's working directory, e.g. "context-store"
         since: optional cutoff — ISO date ("2026-09-01") or epoch seconds/ms
@@ -241,6 +280,7 @@ def session_read(
     Use for requests like "summarize session X": read the transcript,
     summarize it, then persist the summary with `save`
     (path "sessions/<project>/<yyyy-mm-dd>-<slug>", kind "session-summary").
+    Stale summaries can be removed with `delete`.
 
     Includes user/assistant text; skips reasoning, system/synthetic/idle
     messages, and other non-conversational rows; tool calls become one-liners
@@ -283,7 +323,8 @@ def summarize_session(session_id: str | None = None) -> str:
    project-specific configuration discovered.
 3. Check existing summaries with `list` (prefix "sessions/<project>/");
    overwrite only if this session supersedes an earlier one, otherwise
-   pick a distinct slug.
+   pick a distinct slug. If an earlier summary at a different path is
+   superseded, remove it with `delete` so no stale copy lingers.
 4. Call `save` with path "sessions/<project>/<yyyy-mm-dd>-<short-slug>",
    kind "session-summary", the summary as markdown content, and a few
    lowercase topic tags.

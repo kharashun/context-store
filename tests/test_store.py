@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from context_store import store
@@ -129,6 +133,130 @@ def test_delete(store_db):
     assert len(result["content_preview"]) <= 201
     assert store.read_note(store_db, "notes/gone") is None
     assert store.delete_note(store_db, "notes/gone") is None
+
+
+def test_delete_note_response_shape_unchanged(store_db):
+    # regression: single-delete response keys (and their order) stay stable
+    store.save_note(store_db, "notes/gone", "important " * 40, kind="howto", tags=["t"])
+    result = store.delete_note(store_db, "notes/gone")
+    assert list(result) == [
+        "deleted", "path", "kind", "title", "tags",
+        "content_preview", "created_at", "updated_at",
+    ]
+    assert len(result["content_preview"]) <= 201
+
+
+def test_bulk_delete_happy_path(store_env):
+    conn, db_path = store_env
+    store.save_note(conn, "sessions/a/2026-01-one", "first summary", kind="session-summary")
+    store.save_note(conn, "sessions/a/2026-02-two", "second summary", kind="session-summary")
+    store.save_note(conn, "sessions/b/keep", "kept note")
+
+    result = store.delete_notes(conn, db_path, prefix="sessions/a/", expect=2)
+
+    assert result["deleted"] is True
+    assert result["prefix"] == "sessions/a"
+    assert result["count"] == 2
+    assert sorted(n["path"] for n in result["notes"]) == [
+        "sessions/a/2026-01-one", "sessions/a/2026-02-two",
+    ]
+    assert all(len(n["content_preview"]) <= 121 for n in result["notes"])
+    assert Path(result["backup"]).exists()
+    assert "restore" in result["recovery"]
+
+    assert [n["path"] for n in store.list_notes(conn)] == ["sessions/b/keep"]
+    assert store.search_notes(conn, "first summary") == []
+    assert store.read_note(conn, "sessions/a/2026-01-one") is None
+
+
+def test_bulk_delete_backup_is_restorable(store_env):
+    conn, db_path = store_env
+    store.save_note(conn, "sessions/x/one", "content one", kind="session-summary")
+    result = store.delete_notes(conn, db_path, prefix="sessions/x", expect=1)
+
+    snap = sqlite3.connect(f"file:{result['backup']}?mode=ro", uri=True)
+    snap.row_factory = sqlite3.Row
+    try:
+        rows = snap.execute("SELECT path FROM notes ORDER BY path").fetchall()
+    finally:
+        snap.close()
+    assert [r["path"] for r in rows] == ["sessions/x/one"]
+
+
+def test_bulk_delete_expect_mismatch_refuses(store_env):
+    conn, db_path = store_env
+    store.save_note(conn, "sessions/a/one", "x")
+    with pytest.raises(StoreError, match="expect"):
+        store.delete_notes(conn, db_path, prefix="sessions/a", expect=5)
+    assert store.read_note(conn, "sessions/a/one") is not None
+    assert not (db_path.parent / "backups").exists()  # guards run before snapshot
+
+
+def test_bulk_delete_no_matches(store_env):
+    conn, db_path = store_env
+    store.save_note(conn, "notes/keep", "x")
+    with pytest.raises(StoreError, match="no notes under prefix"):
+        store.delete_notes(conn, db_path, prefix="sessions/missing", expect=0)
+    assert store.read_note(conn, "notes/keep") is not None
+
+
+def test_bulk_delete_cap(store_env, monkeypatch):
+    conn, db_path = store_env
+    monkeypatch.setattr(store, "MAX_BULK_DELETE", 3)
+    for i in range(4):
+        store.save_note(conn, f"sessions/a/{i}", f"note {i}")
+    with pytest.raises(StoreError, match="bulk cap"):
+        store.delete_notes(conn, db_path, prefix="sessions/a", expect=4)
+    assert len(store.list_notes(conn, prefix="sessions/a")) == 4
+
+
+def test_bulk_delete_snapshot_failure_is_fail_closed(store_env, monkeypatch):
+    conn, db_path = store_env
+    from context_store import db
+
+    store.save_note(conn, "sessions/a/one", "x")
+
+    def boom(conn, db_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(db, "snapshot", boom)
+    with pytest.raises(StoreError, match="snapshot failed"):
+        store.delete_notes(conn, db_path, prefix="sessions/a", expect=1)
+    assert store.read_note(conn, "sessions/a/one") is not None
+
+
+def test_bulk_delete_rejects_bad_prefix_and_expect(store_env):
+    conn, db_path = store_env
+    for bad_prefix in ("", "   ", "///", None):
+        with pytest.raises(StoreError):
+            store.delete_notes(conn, db_path, prefix=bad_prefix, expect=0)
+    with pytest.raises(StoreError):
+        store.delete_notes(conn, db_path, prefix="sessions/a", expect=-1)
+    with pytest.raises(StoreError):
+        store.delete_notes(conn, db_path, prefix="sessions/a", expect="2")
+
+
+def test_bulk_delete_prunes_old_backups(store_env):
+    conn, db_path = store_env
+    backup_dir = db_path.parent / "backups"
+    backup_dir.mkdir()
+    stale = []
+    for i in range(6):
+        p = backup_dir / f"context-2026010{i}T000000.db"
+        p.write_text("old")
+        stamp = 1_000_000 + i
+        os.utime(p, (stamp, stamp))
+        stale.append(p)
+
+    store.save_note(conn, "sessions/a/one", "x")
+    result = store.delete_notes(conn, db_path, prefix="sessions/a", expect=1)
+    fresh = Path(result["backup"])
+
+    remaining = set(backup_dir.iterdir())
+    assert fresh in remaining
+    assert len(remaining) == 5  # fresh + 4 newest stale
+    assert stale[0] not in remaining and stale[1] not in remaining
+    assert all(s in remaining for s in stale[2:])
 
 
 def test_stats(store_db):
